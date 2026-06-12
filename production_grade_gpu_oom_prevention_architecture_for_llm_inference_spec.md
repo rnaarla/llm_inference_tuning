@@ -363,6 +363,7 @@ class SessionMemoryMeta:
     precision: Literal["fp16", "bf16", "fp8", "int8", "int4"]
 
     # Authoritative residency and lifecycle
+    # SHARED_READY means a reusable shared-prefix blob has been durably committed.
     tier: Literal["gpu", "cpu", "nvme", "shared"]
     state: Literal[
         "GPU_ACTIVE",
@@ -888,6 +889,8 @@ def prefetch_kv(h: SessionMemoryHandle) -> bool:
     return False
 ```
 
+The helpers `lookup_session_handle()`, `serialize()`, and `read_bytes()` are illustrative integration hooks; a concrete backend can map them to its own session registry, codec, and storage I/O layer.
+
 ### 18.2 Requirements for Robustness
 
 A production restore path should include:
@@ -1223,12 +1226,14 @@ def check_cache_rbac(operation: str, actor: str, tenant_id: str):
 ```
 
 ```python
+from typing import Optional
+
 def emit_audit_event(
     operation: str,
     meta: SessionMemoryMeta,
     actor: str,
-    tier_from: str | None = None,
-    tier_to: str | None = None,
+    tier_from: Optional[str] = None,
+    tier_to: Optional[str] = None,
 ):
     event = {
         "timestamp": time.time(),
