@@ -7,6 +7,50 @@
 - **Target systems:** vLLM, Triton-based serving, Ray Serve, and custom LLM inference stacks
 - **Primary focus:** Production-grade GPU OOM prevention through memory-aware scheduling and tiered KV cache control
 
+### Table of Contents
+
+- [1. Document Status](#1-document-status)
+- [2. Executive Summary](#2-executive-summary)
+- [3. Goals](#3-goals)
+- [4. Non-Goals](#4-non-goals)
+- [5. Design Principles](#5-design-principles)
+- [6. Supported Operating Envelope](#6-supported-operating-envelope)
+- [7. Design Invariants](#7-design-invariants)
+- [8. Failure Taxonomy](#8-failure-taxonomy)
+- [9. System Overview](#9-system-overview)
+- [10. Component Responsibilities and Contracts](#10-component-responsibilities-and-contracts)
+- [11. Canonical Data Model](#11-canonical-data-model)
+- [12. Session State Machine](#12-session-state-machine)
+- [13. Memory Tiering Architecture](#13-memory-tiering-architecture)
+- [14. Tier Transition Protocols](#14-tier-transition-protocols)
+- [15. Reservation-Based Admission Control](#15-reservation-based-admission-control)
+- [16. Prefill and Decode Isolation](#16-prefill-and-decode-isolation)
+- [17. Restore vs Recompute Decision Framework](#17-restore-vs-recompute-decision-framework)
+- [18. Restore and Prefetch Architecture](#18-restore-and-prefetch-architecture)
+- [19. Decode Scheduling and Activation Spike Control](#19-decode-scheduling-and-activation-spike-control)
+- [20. Allocator Discipline and Fragmentation Control](#20-allocator-discipline-and-fragmentation-control)
+- [21. Precision and Quantization Policy](#21-precision-and-quantization-policy)
+- [22. Batch and Concurrency Control](#22-batch-and-concurrency-control)
+- [23. Distributed and Multi-GPU Guardrails](#23-distributed-and-multi-gpu-guardrails)
+- [24. Lifecycle Leak Prevention](#24-lifecycle-leak-prevention)
+- [25. Security, Tenant Isolation, and Compliance](#25-security-tenant-isolation-and-compliance)
+- [26. High Availability and Session Recovery](#26-high-availability-and-session-recovery)
+- [27. Observability, Tracing, and SLO Monitoring](#27-observability-tracing-and-slo-monitoring)
+- [28. Cost Model and FinOps](#28-cost-model-and-finops)
+- [29. Numerical Worked Example: 7B vs 13B at 32K Context](#29-numerical-worked-example-7b-vs-13b-at-32k-context)
+- [30. Hardware Tradeoffs: A100 vs H100 vs H200](#30-hardware-tradeoffs-a100-vs-h100-vs-h200)
+- [31. 64K+ Context Breakpoints](#31-64k-context-breakpoints)
+- [32. Backend Integration Plan](#32-backend-integration-plan)
+- [33. Validation Strategy](#33-validation-strategy)
+- [34. Canary Rollout and Policy Tuning](#34-canary-rollout-and-policy-tuning)
+- [35. Failure Modes and Guard Summary](#35-failure-modes-and-guard-summary)
+- [36. Alternatives Considered](#36-alternatives-considered)
+- [37. Risks and Open Questions](#37-risks-and-open-questions)
+- [38. Executive Synthesis](#38-executive-synthesis)
+- [39. Appendix A: Decision Rule of Thumb](#39-appendix-a-decision-rule-of-thumb)
+- [40. Appendix B: 64K+ Economic Reality](#40-appendix-b-64k-economic-reality)
+- [41. Appendix C: One-Line Outcome Statement](#41-appendix-c-one-line-outcome-statement)
+
 ---
 
 ## 2. Executive Summary
@@ -301,7 +345,7 @@ A production design needs a **canonical persisted session record** separate from
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-dataclass
+@dataclass
 class SessionMemoryMeta:
     session_id: str
     tenant_id: str
@@ -319,6 +363,7 @@ class SessionMemoryMeta:
     precision: Literal["fp16", "bf16", "fp8", "int8", "int4"]
 
     # Authoritative residency and lifecycle
+    # SHARED_READY means a reusable shared-prefix blob has been durably committed.
     tier: Literal["gpu", "cpu", "nvme", "shared"]
     state: Literal[
         "GPU_ACTIVE",
@@ -327,6 +372,7 @@ class SessionMemoryMeta:
         "CPU_READY",
         "EVICTING_TO_NVME",
         "NVME_READY",
+        "SHARED_READY",
         "RESTORING",
         "INVALID",
         "RECOVERING",
@@ -357,7 +403,7 @@ class SessionMemoryMeta:
 Runtime state may include non-persisted pointers:
 
 ```python
-dataclass
+@dataclass
 class SessionMemoryHandle:
     meta: SessionMemoryMeta
     kv_gpu: Optional[torch.Tensor]
@@ -474,6 +520,63 @@ The core residency policy is:
 
 ## 14. Tier Transition Protocols
 
+Every authoritative tier transition should use one commit helper so invariants are enforced uniformly: validate the new copy first, durably persist metadata second, emit audit and metrics third, and only then release the warmer copy.
+
+```python
+import hashlib
+from dataclasses import replace
+
+class CorruptTierCopyError(Exception):
+    pass
+
+def compute_blob_checksum(blob: bytes) -> str:
+    # Corruption-detection checksum; confidentiality and authenticity are enforced separately.
+    return hashlib.sha256(blob).hexdigest()
+
+def validate_tensor_copy(tensor: torch.Tensor):
+    if tensor is None or tensor.numel() == 0:
+        raise CorruptTierCopyError("Transition produced no usable tensor copy")
+
+def validate_bytes_checksum(blob: bytes, expected_checksum: str):
+    if compute_blob_checksum(blob) != expected_checksum:
+        raise CorruptTierCopyError("Checksum validation failed")
+
+def commit_transition(
+    h: SessionMemoryHandle,
+    *,
+    tier_to: str,
+    state_to: str,
+    actor: str,
+    validate_new_copy,
+    release_warmer_copy,
+    **meta_updates,
+):
+    validate_new_copy()
+    tier_from = h.meta.tier
+    candidate_meta = replace(
+        h.meta,
+        tier=tier_to,
+        state=state_to,
+        version=h.meta.version + 1,
+        updated_ts=time.time(),
+        **meta_updates,
+    )
+    persist_session_meta(candidate_meta)
+    emit_audit_event(
+        "tier_transition",
+        candidate_meta,
+        actor=actor,
+        tier_from=tier_from,
+        tier_to=tier_to,
+    )
+    metrics.increment(
+        "kv_tier_transition",
+        tags={"tier_from": tier_from, "tier_to": tier_to},
+    )
+    h.meta = candidate_meta
+    release_warmer_copy()
+```
+
 ### 14.1 GPU -> CPU Offload
 
 ```python
@@ -483,10 +586,14 @@ def offload_kv_gpu_to_cpu(h: SessionMemoryHandle):
         cpu_copy = h.kv_gpu.to("cpu", non_blocking=True)
     torch.cuda.synchronize()
     h.kv_cpu = cpu_copy
-    h.meta.tier = "cpu"
-    h.meta.state = "CPU_READY"
-    h.meta.version += 1
-    h.kv_gpu = None
+    commit_transition(
+        h,
+        tier_to="cpu",
+        state_to="CPU_READY",
+        actor="cache_manager_service",
+        validate_new_copy=lambda: validate_tensor_copy(cpu_copy),
+        release_warmer_copy=lambda: setattr(h, "kv_gpu", None),
+    )
 ```
 
 ### 14.2 CPU -> NVMe Offload
@@ -495,19 +602,34 @@ def offload_kv_gpu_to_cpu(h: SessionMemoryHandle):
 def offload_kv_cpu_to_nvme(h: SessionMemoryHandle):
     path = f"/nvme/kvcache/{h.meta.tenant_id}/{h.meta.session_id}.pt"
     tmp_path = f"{path}.tmp"
+    dir_path = os.path.dirname(path)
 
     try:
         h.meta.state = "EVICTING_TO_NVME"
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(h.kv_cpu, tmp_path)
+        os.makedirs(dir_path, exist_ok=True)
+        payload = serialize(h.kv_cpu)
+        checksum = compute_blob_checksum(payload)
+        with open(tmp_path, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        dir_fd = os.open(dir_path, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
-        h.meta.kv_nvme_path = path
-        h.meta.tier = "nvme"
-        h.meta.state = "NVME_READY"
-        h.meta.version += 1
-
-        h.kv_cpu = None
+        commit_transition(
+            h,
+            tier_to="nvme",
+            state_to="NVME_READY",
+            actor="cache_manager_service",
+            validate_new_copy=lambda: validate_bytes_checksum(payload, checksum),
+            release_warmer_copy=lambda: setattr(h, "kv_cpu", None),
+            kv_nvme_path=path,
+            blob_checksum=checksum,
+        )
     except OSError as e:
         logger.error("NVMe offload failed; retaining CPU tier", exc_info=e)
         metrics.increment("kv_nvme_offload_failure")
@@ -519,12 +641,22 @@ def offload_kv_cpu_to_nvme(h: SessionMemoryHandle):
 KV_SHARED_CACHE_TTL_S = int(os.getenv("SHARED_CACHE_TTL_S", "3600"))
 
 def store_shared_kv(h: SessionMemoryHandle):
-    key = f"{h.meta.tenant_id}:{h.meta.model_id}:{h.meta.prompt_contract_hash}"
+    key = make_shared_prefix_key(h.meta)
     try:
-        redis.setex(key, KV_SHARED_CACHE_TTL_S, serialize(h.kv_cpu))
-        h.meta.shared_key = key
-        h.meta.tier = "shared"
-        h.meta.version += 1
+        plaintext = serialize(h.kv_cpu)
+        checksum = compute_blob_checksum(plaintext)
+        ciphertext = encrypt_kv(plaintext, key)
+        redis.setex(key, KV_SHARED_CACHE_TTL_S, ciphertext)
+        commit_transition(
+            h,
+            tier_to="shared",
+            state_to="SHARED_READY",
+            actor="cache_manager_service",
+            validate_new_copy=lambda: validate_bytes_checksum(plaintext, checksum),
+            release_warmer_copy=lambda: setattr(h, "kv_cpu", None),
+            shared_key=key,
+            blob_checksum=checksum,
+        )
     except redis.RedisError as e:
         logger.error("Shared cache store failed; retaining CPU tier", exc_info=e)
         metrics.increment("kv_shared_cache_store_failure")
@@ -578,6 +710,39 @@ def admit_request(req):
 ### 15.4 Principle
 
 **No request is admitted without a memory guarantee.**
+
+### 15.5 Reservation Lifecycle
+
+Reservations must be released on normal completion, request failure or cancellation, restore failure before recompute fallback, and lease expiry so abandoned workers cannot leak the budget ledger.
+
+```python
+RESERVATION_LEASE_S = 30
+
+def reserve_gpu_budget(request_id: str, bytes_reserved: int):
+    budget_ledger.put(
+        request_id,
+        bytes_reserved=bytes_reserved,
+        lease_expires_at=time.time() + RESERVATION_LEASE_S,
+    )
+
+def release_gpu_budget(request_id: str, reason: str):
+    budget_ledger.delete(request_id)
+    metrics.increment("gpu_budget_release", tags={"reason": reason})
+
+def on_request_terminal_state(request_id: str, status: str):
+    release_reason = {
+        "completed": "normal_completion",
+        "cancelled": "request_cancelled",
+        "failed": "request_failed",
+    }.get(status)
+    if release_reason is None:
+        raise ValueError(f"Unexpected terminal status: {status}")
+    release_gpu_budget(request_id, reason=release_reason)
+
+def sweep_expired_reservations():
+    for reservation in budget_ledger.expired(now=time.time()):
+        release_gpu_budget(reservation.request_id, reason="lease_expired")
+```
 
 ---
 
@@ -640,6 +805,7 @@ The decision should consider:
 ```python
 def schedule_request(req):
     meta = estimate_session_meta(req)
+    h = lookup_session_handle(meta.session_id)
 
     recompute_time = estimate_recompute_time(meta)
     restore_time = estimate_restore_time(meta)
@@ -653,18 +819,27 @@ def schedule_request(req):
     else:
         strategy = "recompute"
 
-    projected_mem = meta.kv_bytes + meta.activation_bytes_peak
-    if projected_mem > free_gpu_memory():
+    if not admit_request(req):
         reject_or_queue(req)
         return
 
-    if strategy == "restore":
-        prefetch_kv(meta.session_id)
-        wait_for_kv_ready(meta.session_id)
-    else:
-        invalidate_existing_cache(meta.session_id)
+    try:
+        if strategy == "restore":
+            if not prefetch_kv(h):
+                release_gpu_budget(req.request_id, reason="restore_failed")
+                invalidate_existing_cache(meta.session_id)
+                if not admit_request(req):
+                    reject_or_queue(req)
+                    return
+            else:
+                wait_for_kv_ready(meta.session_id)
+        else:
+            invalidate_existing_cache(meta.session_id)
 
-    dispatch_decode(req)
+        dispatch_decode(req)
+    except Exception:
+        release_gpu_budget(req.request_id, reason="request_failed")
+        raise
 ```
 
 ### 17.3 Overload Rule
@@ -685,14 +860,39 @@ If the restore pipeline becomes saturated, the scheduler should:
 Restore happens **before decode**, never inline inside the decoder critical path.
 
 ```python
-def prefetch_kv(h):
+def validate_restore_blob(meta: SessionMemoryMeta, blob: bytes, tier: str) -> bool:
+    if compute_blob_checksum(blob) != meta.blob_checksum:
+        metrics.increment("kv_restore_corrupt", tags={"tier": tier})
+        emit_audit_event(
+            "restore_corrupt",
+            meta,
+            actor="inference_worker",
+            tier_from=tier,
+            tier_to="invalid",
+        )
+        return False
+    return True
+
+def prefetch_kv(h: SessionMemoryHandle) -> bool:
     if h.meta.tier == "cpu":
         async_cpu_to_gpu(h)
+        return True
     elif h.meta.tier == "nvme":
-        async_nvme_to_gpu(h)
+        raw = read_bytes(h.meta.kv_nvme_path)
+        if not validate_restore_blob(h.meta, raw, tier="nvme"):
+            return False
+        h.kv_cpu = deserialize(raw)
+        async_cpu_to_gpu(h)
+        return True
     elif h.meta.tier == "shared":
-        async_shared_to_gpu(h)
+        if not restore_shared_kv(h):
+            return False
+        async_cpu_to_gpu(h)
+        return True
+    return False
 ```
+
+The helpers `lookup_session_handle()`, `serialize()`, and `read_bytes()` are illustrative integration hooks; a concrete backend can map them to its own session registry, codec, and storage I/O layer.
 
 ### 18.2 Requirements for Robustness
 
@@ -916,28 +1116,48 @@ def detect_gpu_memory_leak(window_minutes: int = 30, threshold_mb_per_min: float
 ### 25.1 Tenant-Scoped Cache Keys
 
 ```python
-def make_cache_key(meta: SessionMemoryMeta) -> str:
+def make_session_cache_key(meta: SessionMemoryMeta) -> str:
     return f"{meta.tenant_id}:{meta.session_id}"
+
+def make_shared_prefix_key(meta: SessionMemoryMeta) -> str:
+    return f"{meta.tenant_id}:{meta.model_id}:{meta.prompt_contract_hash}"
 ```
+
+Session resume artifacts and shared prefix-reuse artifacts intentionally occupy different key namespaces so a resumed session never reads a reusable prefix blob by accident.
 
 ### 25.2 Authorized Restore
 
 ```python
 def restore_shared_kv(h: SessionMemoryHandle) -> bool:
-    key = make_cache_key(h.meta)
+    key = make_shared_prefix_key(h.meta)
     if not authorize_cache_access(h.meta.tenant_id, key):
         raise PermissionError(
             f"Tenant {h.meta.tenant_id} not authorized to access cache key {key}"
         )
     try:
-        raw = redis.get(key)
+        ciphertext = redis.get(key)
     except redis.RedisError as e:
         logger.error("Redis restore failed", exc_info=e)
         metrics.increment("kv_shared_cache_restore_failure")
         return False
-    if raw is None:
+    if ciphertext is None:
         return False
-    h.kv_cpu = deserialize(raw)
+    try:
+        plaintext = decrypt_kv(ciphertext, key)
+    except Exception as e:
+        logger.error("Shared cache decrypt failed", exc_info=e)
+        metrics.increment("kv_shared_cache_corrupt")
+        emit_audit_event(
+            "shared_restore_corrupt",
+            h.meta,
+            actor="inference_worker",
+            tier_from="shared",
+            tier_to="invalid",
+        )
+        return False
+    if not validate_restore_blob(h.meta, plaintext, tier="shared"):
+        return False
+    h.kv_cpu = deserialize(plaintext)
     return True
 ```
 
@@ -949,18 +1169,18 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KV_ENCRYPTION_KEY = bytes.fromhex(os.environ["KV_AES256_KEY_HEX"])
 
-def _make_aad(tenant_id: str, session_id: str) -> bytes:
-    return f"{tenant_id}:{session_id}".encode()
+def _make_aad(cache_key: str) -> bytes:
+    return cache_key.encode()
 
-def encrypt_kv(data: bytes, tenant_id: str, session_id: str) -> bytes:
+def encrypt_kv(data: bytes, cache_key: str) -> bytes:
     aesgcm = AESGCM(KV_ENCRYPTION_KEY)
     nonce = os.urandom(12)
-    aad = _make_aad(tenant_id, session_id)
+    aad = _make_aad(cache_key)
     return nonce + aesgcm.encrypt(nonce, data, aad)
 
-def decrypt_kv(data: bytes, tenant_id: str, session_id: str) -> bytes:
+def decrypt_kv(data: bytes, cache_key: str) -> bytes:
     aesgcm = AESGCM(KV_ENCRYPTION_KEY)
-    aad = _make_aad(tenant_id, session_id)
+    aad = _make_aad(cache_key)
     return aesgcm.decrypt(data[:12], data[12:], aad)
 ```
 
@@ -1009,13 +1229,22 @@ def check_cache_rbac(operation: str, actor: str, tenant_id: str):
 ```
 
 ```python
-def emit_audit_event(operation: str, meta: SessionMemoryMeta, actor: str):
+from typing import Optional
+
+def emit_audit_event(
+    operation: str,
+    meta: SessionMemoryMeta,
+    actor: str,
+    tier_from: Optional[str] = None,
+    tier_to: Optional[str] = None,
+):
     event = {
         "timestamp": time.time(),
         "operation": operation,
         "session_id": meta.session_id,
         "tenant_id": meta.tenant_id,
-        "tier_from": meta.tier,
+        "tier_from": tier_from or meta.tier,
+        "tier_to": tier_to or meta.tier,
         "actor": actor,
         "data_zone": meta.data_zone,
     }
@@ -1032,11 +1261,37 @@ Persist metadata on every authoritative tier transition:
 
 ```python
 SESSION_META_TTL_S = int(os.getenv("SESSION_META_TTL_S", "86400"))
+MAX_META_CAS_RETRIES = 5
+
+class MetadataConflictError(Exception):
+    pass
 
 def persist_session_meta(meta: SessionMemoryMeta):
     key = f"session_meta:{meta.tenant_id}:{meta.session_id}"
-    redis_cluster.setex(key, SESSION_META_TTL_S, json.dumps(asdict(meta)))
+    expected_version = meta.version - 1
+    with redis_cluster.pipeline() as pipe:
+        for attempt in range(MAX_META_CAS_RETRIES):
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                try:
+                    stored_version = 0 if raw is None else json.loads(raw)["version"]
+                except (json.JSONDecodeError, KeyError) as e:
+                    raise MetadataConflictError(f"Corrupt metadata at key {key}") from e
+                if stored_version != expected_version:
+                    raise MetadataConflictError(
+                        f"Expected version {expected_version}, found {stored_version}"
+                    )
+                pipe.multi()
+                pipe.setex(key, SESSION_META_TTL_S, json.dumps(asdict(meta)))
+                pipe.execute()
+                return
+            except redis.WatchError:
+                time.sleep(0.01 * (2**attempt))
+        raise MetadataConflictError(f"CAS retry budget exhausted for key {key}")
 ```
+
+Blind writes are unsafe here because concurrent restore, eviction, or recovery flows can otherwise overwrite each other's authoritative tier transition and lose the newest state.
 
 ### 26.2 Recovery After Node Failure
 
@@ -1074,7 +1329,7 @@ def replicate_cpu_kv(h: SessionMemoryHandle, secondary_node: str):
     try:
         remote_store.put(
             node=secondary_node,
-            key=make_cache_key(h.meta),
+            key=make_session_cache_key(h.meta),
             data=serialize(h.kv_cpu),
         )
     except RemoteStoreError as e:
@@ -1088,14 +1343,16 @@ def replicate_cpu_kv(h: SessionMemoryHandle, secondary_node: str):
 
 ```python
 class CircuitBreaker:
-    def __init__(self, threshold: float = 0.85):
-        self.threshold = threshold
+    def __init__(self, config: InferenceMemoryConfig):
+        self.threshold = config.circuit_breaker_memory_threshold
 
     def check(self, gpu_memory_fraction: float):
         if gpu_memory_fraction > self.threshold:
             activate_fallback_model()
             shed_low_priority_requests()
             metrics.increment("circuit_breaker_open")
+
+circuit_breaker = CircuitBreaker(config)
 ```
 
 ### 26.5 Rolling Upgrades
@@ -1137,6 +1394,7 @@ recompute_ratio = Gauge("kv_recompute_ratio")
 gpu_residency = Gauge("gpu_kv_bytes", labelnames=["tenant_id"])
 gpu_memory_fragmentation = Gauge("gpu_memory_fragmentation_ratio")
 cuda_oom_total = Counter("cuda_oom_total", labelnames=["tenant_id"])
+tier_transition_total = Counter("kv_tier_transition_total", labelnames=["tier_from", "tier_to"])
 tier_transition_failures = Counter("kv_tier_transition_failures", labelnames=["tier", "operation"])
 ```
 
@@ -1603,4 +1861,4 @@ At very large context windows, the marginal cost per token rises superlinearly. 
 
 ## 41. Appendix C: One-Line Outcome Statement
 
-**We reduce GPU spend and OOM risk by treating inference memory as governed state rather than accidental runtime residue.
+**We reduce GPU spend and OOM risk by treating inference memory as governed state rather than accidental runtime residue.**
