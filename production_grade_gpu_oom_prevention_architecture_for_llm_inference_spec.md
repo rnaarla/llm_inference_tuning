@@ -530,6 +530,7 @@ class CorruptTierCopyError(Exception):
     pass
 
 def compute_blob_checksum(blob: bytes) -> str:
+    # Corruption-detection checksum; confidentiality and authenticity are enforced separately.
     return hashlib.sha256(blob).hexdigest()
 
 def validate_tensor_copy(tensor: torch.Tensor):
@@ -652,7 +653,7 @@ def store_shared_kv(h: SessionMemoryHandle):
             state_to="SHARED_READY",
             actor="cache_manager_service",
             validate_new_copy=lambda: validate_bytes_checksum(plaintext, checksum),
-            release_warmer_copy=lambda: None,
+            release_warmer_copy=lambda: setattr(h, "kv_cpu", None),
             shared_key=key,
             blob_checksum=checksum,
         )
@@ -733,7 +734,9 @@ def on_request_terminal_state(request_id: str, status: str):
         "completed": "normal_completion",
         "cancelled": "request_cancelled",
         "failed": "request_failed",
-    }[status]
+    }.get(status)
+    if release_reason is None:
+        raise ValueError(f"Unexpected terminal status: {status}")
     release_gpu_budget(request_id, reason=release_reason)
 
 def sweep_expired_reservations():
@@ -1258,6 +1261,7 @@ Persist metadata on every authoritative tier transition:
 
 ```python
 SESSION_META_TTL_S = int(os.getenv("SESSION_META_TTL_S", "86400"))
+MAX_META_CAS_RETRIES = 5
 
 class MetadataConflictError(Exception):
     pass
@@ -1266,11 +1270,14 @@ def persist_session_meta(meta: SessionMemoryMeta):
     key = f"session_meta:{meta.tenant_id}:{meta.session_id}"
     expected_version = meta.version - 1
     with redis_cluster.pipeline() as pipe:
-        while True:
+        for attempt in range(MAX_META_CAS_RETRIES):
             try:
                 pipe.watch(key)
                 raw = pipe.get(key)
-                stored_version = 0 if raw is None else json.loads(raw)["version"]
+                try:
+                    stored_version = 0 if raw is None else json.loads(raw)["version"]
+                except (json.JSONDecodeError, KeyError) as e:
+                    raise MetadataConflictError(f"Corrupt metadata at key {key}") from e
                 if stored_version != expected_version:
                     raise MetadataConflictError(
                         f"Expected version {expected_version}, found {stored_version}"
@@ -1280,7 +1287,8 @@ def persist_session_meta(meta: SessionMemoryMeta):
                 pipe.execute()
                 return
             except redis.WatchError:
-                continue
+                time.sleep(0.01 * (2**attempt))
+        raise MetadataConflictError(f"CAS retry budget exhausted for key {key}")
 ```
 
 Blind writes are unsafe here because concurrent restore, eviction, or recovery flows can otherwise overwrite each other's authoritative tier transition and lose the newest state.
